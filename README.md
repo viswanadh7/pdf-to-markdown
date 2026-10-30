@@ -25,12 +25,39 @@ console.log(markdown);
 `pdfToMarkdown` accepts a `Buffer`, `Uint8Array`, or `ArrayBuffer` and
 resolves to a Markdown string.
 
+### What it detects
+
+- **Headings** from font size and weight relative to the document's body
+  text; multi-line headings are joined.
+- **Paragraphs**, with wrapped lines and hyphenated words joined, including
+  paragraphs that continue across columns and pages.
+- **Bold, italic, inline code and links** inside running text.
+- **Bulleted and numbered lists**, including wrapped and nested items.
+- **Tables** from column alignment, with wrapped cells kept together and
+  tables that continue onto the next page merged (repeated header rows are
+  dropped).
+- **Two-column layouts**, read left column first; full-width titles that
+  span both columns are kept in place.
+- **Code blocks** from monospace fonts, and JSON-like data blocks.
+- **Running headers, footers and page numbers** repeated across pages are
+  removed.
+
+Scanned PDFs (images without a text layer) produce no text; run OCR first.
+
 ### Options
 
 ```ts
 await pdfToMarkdown(data, {
-  pageBreaks: true, // insert a `---` rule between pages. Default: false
+  pageBreaks: true, // separate pages with a `---` rule instead of joining them. Default: false
+  keepHeadersFooters: true, // keep running headers, footers and page numbers. Default: false
 });
+```
+
+## Development
+
+```sh
+npm test        # build, then run the regression tests (PDFs generated with pdfkit)
+npm run sample  # build, then convert test/sample.pdf to test/sample.md
 ```
 
 ## Requirements
