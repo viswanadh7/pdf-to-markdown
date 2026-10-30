@@ -16,7 +16,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node test/index.ts"
+    "test": "node test/index.ts",
+    "sample": "npm run build && node test/index.ts"
   },
   "keywords": [
     "pdf",
