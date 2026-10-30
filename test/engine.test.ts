@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { deflateSync } from "node:zlib";
 import PDFDocument from "pdfkit";
 import { pdfToMarkdown, type PdfToMarkdownOptions } from "../dist/index.js";
 
@@ -19,6 +20,46 @@ async function render(
   return pdfToMarkdown(Buffer.concat(chunks), options);
 }
 
+/** A minimal RGB PNG with a colour gradient, for embedding with pdfkit. */
+function gradientPng(width: number, height: number, seed = 0): Buffer {
+  const raw = Buffer.alloc((width * 3 + 1) * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const o = y * (width * 3 + 1) + 1 + x * 3;
+      raw[o] = (x * 255) / width;
+      raw[o + 1] = (y * 255) / height;
+      raw[o + 2] = seed;
+    }
+  }
+  const chunk = (type: string, body: Buffer) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(body.length);
+    // pdfkit does not verify chunk CRCs.
+    return Buffer.concat([len, Buffer.from(type), body, Buffer.alloc(4)]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+/** Decodes the PNG size from each image definition at the end of the output. */
+function embeddedImages(md: string): { label: string; width: number; height: number }[] {
+  return [...md.matchAll(/^\[(image-\d+)\]: data:image\/png;base64,(\S+)$/gm)].map(
+    ([, label, b64]) => {
+      const png = Buffer.from(b64, "base64");
+      assert.equal(png.subarray(1, 4).toString(), "PNG");
+      return { label, width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+    },
+  );
+}
 
 const LOREM =
   "The quick brown fox jumps over the lazy dog while the committee reviews " +
@@ -226,4 +267,45 @@ test("narrow indented blocks still join wrapped lines", async () => {
     md.trim(),
     `${LOREM}\n\n${LOREM}\n\nShort line one\n\nShort line two`,
   );
+});
+
+test("images are embedded in reading order as PNG data URIs", async () => {
+  const md = await render((doc) => {
+    doc.font("Helvetica").fontSize(10).text("Text before the figure.");
+    doc.image(gradientPng(120, 80), 60, doc.y + 10, { width: 120 });
+    doc.text("Text after the figure.", 60, 300);
+  });
+  assert.match(
+    md,
+    /^Text before the figure\.\n\n!\[Image 1\]\[image-1\]\n\nText after the figure\.\n\n\[image-1\]: data:image\/png;base64,/,
+  );
+  assert.deepEqual(embeddedImages(md), [{ label: "image-1", width: 120, height: 80 }]);
+});
+
+test("images are downscaled to imageDpi and can be disabled", async () => {
+  // 600px drawn 150pt wide is 288 DPI.
+  const draw = (doc: Doc) => doc.image(gradientPng(600, 300), 60, 60, { width: 150 });
+  assert.deepEqual(embeddedImages(await render(draw)), [
+    { label: "image-1", width: 300, height: 150 },
+  ]);
+  assert.deepEqual(embeddedImages(await render(draw, { imageDpi: Infinity })), [
+    { label: "image-1", width: 600, height: 300 },
+  ]);
+  assert.equal((await render(draw, { images: false })).trim(), "");
+});
+
+test("repeated header logos are dropped and duplicate images share data", async () => {
+  const logo = gradientPng(60, 30, 200);
+  const figure = gradientPng(80, 80, 50);
+  const md = await render((doc) => {
+    for (let page = 1; page <= 3; page++) {
+      if (page > 1) doc.addPage();
+      doc.image(logo, 60, 20, { width: 60 });
+      doc.font("Helvetica").fontSize(10).text(`Page ${page} body.`, 60, 120);
+    }
+    doc.image(figure, 60, 200, { width: 80 });
+    doc.image(figure, 60, 400, { width: 80 });
+  });
+  assert.equal(md.match(/!\[Image 1\]\[image-1\]/g)?.length, 2, md);
+  assert.deepEqual(embeddedImages(md), [{ label: "image-1", width: 80, height: 80 }]);
 });

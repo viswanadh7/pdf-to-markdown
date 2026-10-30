@@ -1,10 +1,19 @@
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import { extractImages, type PageImage } from "./images.js";
 
 export interface PdfToMarkdownOptions {
   /** Separate pages with `---` instead of joining content that flows across pages. */
   pageBreaks?: boolean;
   /** Keep running headers, footers and page numbers (removed by default). */
   keepHeadersFooters?: boolean;
+  /** Embed images as base64 PNG data URIs (default true). */
+  images?: boolean;
+  /**
+   * Downscale embedded images to at most this resolution at their printed
+   * size (default 144, sharp on high-density screens). `Infinity` keeps the
+   * original pixels.
+   */
+  imageDpi?: number;
 }
 
 /** A positioned, styled piece of text as reported by pdf.js. */
@@ -36,6 +45,7 @@ interface Segment {
   glyphs: Glyph[];
   runs: Run[];
   text: string;
+  image?: PageImage;
 }
 
 interface Line {
@@ -48,6 +58,8 @@ interface Line {
   segments: Segment[];
   runs: Run[];
   text: string;
+  /** Set on the pseudo-line standing in for an image. */
+  image?: PageImage;
 }
 
 interface Page {
@@ -78,6 +90,7 @@ type Block =
       marker: string | null;
     }
   | { kind: "code"; lines: { x0: number; text: string }[]; size: number }
+  | { kind: "image"; image: PageImage }
   | TableBlock;
 
 interface Stats {
@@ -112,7 +125,12 @@ export async function pdfToMarkdown(
   try {
     for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
       const page = await doc.getPage(pageNum);
-      pages.push(await extractPage(page));
+      pages.push(
+        await extractPage(
+          page,
+          options.images === false ? 0 : (options.imageDpi ?? 144),
+        ),
+      );
       page.cleanup();
     }
   } finally {
@@ -137,18 +155,23 @@ export async function pdfToMarkdown(
     return blocks;
   });
 
+  const images = new ImageRefs();
   let markdown: string;
   if (options.pageBreaks) {
     markdown = pageBlocks
-      .map(renderBlocks)
+      .map((blocks) => renderBlocks(blocks, images))
       .filter((p) => p.length > 0)
       .join("\n\n---\n\n");
   } else {
     const all: Block[] = [];
     for (const blocks of pageBlocks) appendBlocks(all, blocks);
-    markdown = renderBlocks(all);
+    markdown = renderBlocks(all, images);
   }
-  return markdown.trim() + "\n";
+  markdown = markdown.trim();
+  if (images.definitions.length) {
+    markdown += "\n\n" + images.definitions.join("\n");
+  }
+  return markdown + "\n";
 }
 
 function toPlainUint8Array(
@@ -171,15 +194,24 @@ interface PdfTextItem {
   fontName: string;
 }
 
-async function extractPage(page: pdfjsLib.PDFPageProxy): Promise<Page> {
+/** `imageDpi` of 0 skips images. */
+async function extractPage(
+  page: pdfjsLib.PDFPageProxy,
+  imageDpi: number,
+): Promise<Page> {
   const [, viewBottom, , viewTop] = page.view;
 
   // Loading the operator list resolves the page's fonts into commonObjs,
-  // which is the only place their real names (and so bold/italic) live.
+  // which is the only place their real names (and so bold/italic) live. It
+  // also says where each image is drawn.
+  let images: PageImage[] = [];
   try {
-    await page.getOperatorList();
+    const ops = await page.getOperatorList({
+      annotationMode: pdfjsLib.AnnotationMode.DISABLE,
+    });
+    if (imageDpi > 0) images = await extractImages(page, ops, imageDpi);
   } catch {
-    // Font styles fall back to the generic family below.
+    // Font styles fall back to the generic family below; no images.
   }
   const content = await page.getTextContent();
   const fontStyle = fontStyleResolver(page, content.styles);
@@ -209,8 +241,14 @@ async function extractPage(page: pdfjsLib.PDFPageProxy): Promise<Page> {
     glyphs.push(glyph);
   }
 
+  // An image sits in the reading order at its top edge.
+  const imageLines = images.map((image) =>
+    makeLine(image.top, [
+      { x0: image.x0, x1: image.x1, glyphs: [], runs: [], text: "", image },
+    ]),
+  );
   return {
-    lines: groupIntoLines(glyphs),
+    lines: [...groupIntoLines(glyphs), ...imageLines].sort((a, b) => b.y - a.y),
     top: viewTop,
     bottom: viewBottom,
     height: viewTop - viewBottom,
@@ -370,7 +408,7 @@ function makeLine(y: number, segments: Segment[]): Line {
     if (g.mono) monoChars += n;
     sizeWeight.set(g.size, (sizeWeight.get(g.size) ?? 0) + n);
   }
-  let size = glyphs[0].size;
+  let size = glyphs[0]?.size ?? 0;
   let best = -1;
   for (const [s, w] of sizeWeight) {
     if (w > best) {
@@ -389,6 +427,7 @@ function makeLine(y: number, segments: Segment[]): Line {
     segments,
     runs,
     text: runsText(runs),
+    image: segments.length === 1 ? segments[0].image : undefined,
   };
 }
 
@@ -454,8 +493,12 @@ function removeRunningHeadersAndFooters(pages: Page[]): void {
   const inMargin = (page: Page, line: Line) =>
     line.y >= page.top - page.height * MARGIN_FRACTION ||
     line.y <= page.bottom + page.height * MARGIN_FRACTION;
+  // Repeated logos are matched by content, repeated text with page numbers
+  // masked out.
   const key = (line: Line) =>
-    line.text.toLowerCase().replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+    line.image
+      ? `image:${line.image.key}`
+      : line.text.toLowerCase().replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
 
   const pagesWithKey = new Map<string, number>();
   for (const page of pages) {
@@ -891,6 +934,11 @@ function textToBlocks(
   let listBaseX = 0;
 
   for (const line of lines) {
+    if (line.image) {
+      blocks.push({ kind: "image", image: line.image });
+      prev = null;
+      continue;
+    }
     if (!line.text) continue;
     const last = blocks[blocks.length - 1];
     const gap = prev ? prev.y - line.y : Infinity;
@@ -1080,10 +1128,30 @@ function appendBlocks(target: Block[], next: Block[]): void {
 // Rendering
 // ---------------------------------------------------------------------------
 
-function renderBlocks(blocks: Block[]): string {
+/**
+ * Numbers images in document order. The page body holds short reference
+ * links; the base64 data is defined once, at the end of the document.
+ */
+class ImageRefs {
+  readonly definitions: string[] = [];
+  private readonly labels = new Map<string, string>();
+
+  reference(image: PageImage): string {
+    let label = this.labels.get(image.key);
+    if (!label) {
+      label = `image-${this.labels.size + 1}`;
+      this.labels.set(image.key, label);
+      this.definitions.push(`[${label}]: ${image.src}`);
+    }
+    return `![Image ${label.slice("image-".length)}][${label}]`;
+  }
+}
+
+function renderBlocks(blocks: Block[], images: ImageRefs): string {
   let out = "";
   blocks.forEach((block, i) => {
-    const rendered = renderBlock(block);
+    const rendered =
+      block.kind === "image" ? images.reference(block.image) : renderBlock(block);
     if (!rendered) return;
     if (out) {
       const prev = blocks[i - 1];
@@ -1116,6 +1184,8 @@ function renderBlock(block: Block): string {
     }
     case "table":
       return renderTable(block.rows);
+    case "image":
+      return "";
   }
 }
 
