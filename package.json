@@ -1,7 +1,7 @@
 {
   "name": "@viswanadh_mudunuru/pdf-to-markdown",
   "version": "1.0.1",
-  "description": "Convert PDF files to Markdown using layout heuristics (font size, bullets, paragraph spacing).",
+  "description": "Convert PDF files to Markdown using layout heuristics: headings, paragraphs, lists, tables, columns and inline styles.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,7 +16,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node test/index.ts"
+    "test": "npm run build && node --test test/engine.test.ts",
+    "sample": "npm run build && node test/index.ts"
   },
   "keywords": [
     "pdf",
