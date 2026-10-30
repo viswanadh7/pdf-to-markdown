@@ -16,7 +16,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node test/index.ts",
+    "test": "npm run build && node --test test/engine.test.ts",
     "sample": "npm run build && node test/index.ts"
   },
   "keywords": [
